@@ -1,15 +1,19 @@
 import asyncio
 import os
+import time
 from collections import deque
 
 import discord
 import yt_dlp
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 COOKIES_FILE = os.getenv("YTDLP_COOKIES")  # optional, see README
+
+IDLE_TIMEOUT = 5 * 60  # seconds with nothing playing before leaving
+ALONE_TIMEOUT = 60  # seconds with no humans in the channel before leaving
 
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
@@ -54,9 +58,61 @@ class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.queues = {}  # guild_id -> deque[Track]
+        self.text_channels = {}  # guild_id -> channel to post the auto-leave notice in
+        self.idle_since = {}  # guild_id -> time.monotonic() when playback stopped
+        self.alone_since = {}  # guild_id -> time.monotonic() when the last human left
+
+    async def cog_load(self):
+        self.check_inactivity.start()
+
+    async def cog_unload(self):
+        self.check_inactivity.cancel()
 
     def get_queue(self, guild_id):
         return self.queues.setdefault(guild_id, deque())
+
+    @tasks.loop(seconds=15)
+    async def check_inactivity(self):
+        now = time.monotonic()
+        connected = {vc.guild.id for vc in self.bot.voice_clients}
+        # Forget guilds we've left, so a stale timestamp can't kick us right after rejoining
+        for timers in (self.idle_since, self.alone_since):
+            for guild_id in list(timers):
+                if guild_id not in connected:
+                    del timers[guild_id]
+
+        for vc in list(self.bot.voice_clients):
+            guild_id = vc.guild.id
+            if vc.is_playing() or vc.is_paused():
+                self.idle_since.pop(guild_id, None)
+            else:
+                self.idle_since.setdefault(guild_id, now)
+
+            if any(not m.bot for m in vc.channel.members):
+                self.alone_since.pop(guild_id, None)
+            else:
+                self.alone_since.setdefault(guild_id, now)
+
+            if now - self.alone_since.get(guild_id, now) >= ALONE_TIMEOUT:
+                reason = "everyone left the channel"
+            elif now - self.idle_since.get(guild_id, now) >= IDLE_TIMEOUT:
+                reason = "nothing has played for 5 minutes"
+            else:
+                continue
+
+            self.get_queue(guild_id).clear()
+            # An uncaught error here would stop the loop for good, so just log it
+            try:
+                await vc.disconnect()
+                channel = self.text_channels.get(guild_id)
+                if channel:
+                    await channel.send(f"Left the voice channel because {reason}.")
+            except discord.HTTPException as e:
+                print(f"Auto-leave error: {e}")
+
+    @check_inactivity.before_loop
+    async def before_check_inactivity(self):
+        await self.bot.wait_until_ready()
 
     async def ensure_voice(self, ctx):
         """Connect to (or move to) the caller's voice channel. Returns the VoiceClient or None."""
@@ -71,6 +127,7 @@ class Music(commands.Cog):
             await ctx.send(f"I don't have permission to join **{channel.name}**. Give me View Channel and Connect there.")
             return None
 
+        self.text_channels[ctx.guild.id] = ctx.channel
         vc = ctx.voice_client
         if vc is None:
             return await channel.connect()
