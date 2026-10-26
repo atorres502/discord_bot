@@ -1,0 +1,14 @@
+services:
+  discbot:
+    build: .
+    container_name: discbot
+    restart: unless-stopped
+    env_file: .env
+    # Keep it from competing with the media apps on the same box
+    mem_limit: 256m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

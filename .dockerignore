@@ -1,0 +1,7 @@
+.venv/
+.git/
+__pycache__/
+.env
+cookies.txt
+bot.log
+*.tar
